@@ -1,0 +1,5 @@
+project_id = "xabwaqkexewmubeqnhwj"
+[functions.chat-agent]
+verify_jwt = false
+[functions.analyze-document]
+verify_jwt = false

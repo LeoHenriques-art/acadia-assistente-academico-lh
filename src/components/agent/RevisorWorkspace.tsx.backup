@@ -1,0 +1,981 @@
+import { useEffect, useRef, useState, useCallback } from "react";
+import {
+  Send, Trash2, User, Brain, FileText, AlertTriangle,
+  CheckCircle2, XCircle, Info, Sparkles, BarChart2,
+  GitCompare, PenLine, ChevronDown, ChevronUp, Copy,
+  RefreshCw, BookOpen, Lightbulb, Star, AlertCircle,
+  FileSearch, Layers, ArrowRight, Eye, EyeOff, Edit3,
+  Highlighter, FileCode, History, Target, Award,
+  TrendingUp, Zap, CheckSquare, Square, X, Plus
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Separator } from "@/components/ui/separator";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { toast } from "sonner";
+import { type Agent } from "@/lib/agents";
+import {
+  getOrCreateActiveProject, listMemory, addMemory,
+  buildProjectContext, type Project, type MemoryItem
+} from "@/lib/project";
+import { loadDbMessages, insertMessage, clearDbMessages } from "@/lib/chat-db";
+import { listDocuments, buildDocumentsContext, type ProjectDocument } from "@/lib/documents";
+import { Link } from "@tanstack/react-router";
+
+interface ChatMessage { role: "user" | "assistant"; content: string; timestamp: number; }
+
+interface TextVersion {
+  id: string;
+  content: string;
+  timestamp: number;
+  label: string;
+  chapter?: string;
+  scores?: ScoreData;
+}
+
+interface SuggestionInline {
+  id: string;
+  type: "grammar" | "style" | "coherence" | "structure" | "vocabulary";
+  start: number;
+  end: number;
+  original: string;
+  suggestion: string;
+  explanation: string;
+  severity: "critical" | "important" | "suggestion";
+  accepted?: boolean;
+}
+
+interface RevisionAnalysis {
+  scores: ScoreData;
+  suggestions: SuggestionInline[];
+  sections: {
+    critical: string[];
+    important: string[];
+    suggestions: string[];
+    positives: string[];
+  };
+  revisedText?: string;
+  coherence: {
+    score: number;
+    issues: string[];
+    improvements: string[];
+  };
+}
+
+const CHAT_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/chat-agent`;
+
+// ─── Revision types ───────────────────────────────────────────────────────────
+const REVISION_MODES = [
+  { id: "completa", label: "Revisão Completa", icon: FileSearch, desc: "Gramática, estilo, coerência e estrutura" },
+  { id: "gramatica", label: "Gramática & Ortografia", icon: PenLine, desc: "Erros linguísticos e ortográficos" },
+  { id: "academica", label: "Linguagem Académica", icon: BookOpen, desc: "Formalidade, precisão e tom científico" },
+  { id: "estrutura", label: "Estrutura Textual", icon: Layers, desc: "Organização, coesão e fluxo de ideias" },
+  { id: "coerencia", label: "Coerência & Argumentação", icon: GitCompare, desc: "Lógica, consistência e fundamentação" },
+  { id: "comparar", label: "Comparar Versões", icon: GitCompare, desc: "Diferenças entre duas versões de texto" },
+];
+
+const CHAPTER_TYPES = [
+  "Introdução", "Revisão de Literatura", "Metodologia",
+  "Resultados", "Discussão", "Conclusão", "Abstract/Resumo"
+];
+
+const QUICK_ACTIONS = [
+  { label: "Rever introdução", prompt: "Revisa académicamente a introdução do meu PFC. Analisa gramática, linguagem académica, estrutura e coerência." },
+  { label: "Melhorar escrita", prompt: "Melhora a linguagem académica do seguinte texto, tornando-o mais formal, preciso e científico:" },
+  { label: "Detectar repetições", prompt: "Identifica e lista todas as repetições de palavras, ideias e estruturas no seguinte texto:" },
+  { label: "Verificar coerência", prompt: "Verifica a coerência lógica e argumentativa do seguinte texto académico:" },
+  { label: "Score de qualidade", prompt: "Faz uma avaliação completa da qualidade académica do seguinte texto com uma pontuação de 0-10 em cada critério:" },
+  { label: "Sugerir reformulações", prompt: "Sugere reformulações académicas para melhorar as frases problemáticas do seguinte texto:" },
+];
+
+// ─── System prompt ────────────────────────────────────────────────────────────
+function buildRevisorSystemPrompt(project: Project | null, memory: MemoryItem[], docs: ProjectDocument[]): string {
+  return `Você é o **Revisor Académico IA** da plataforma ACADIA — um revisor científico profissional especializado em trabalhos académicos (PFC/TCC/Dissertações).
+
+Você NÃO é um chatbot genérico. Você é um revisor científico rigoroso que analisa textos académicos com profundidade profissional.
+
+## SUAS COMPETÊNCIAS PRINCIPAIS:
+
+### 1. Revisão Gramatical e Ortográfica
+- Identifica erros gramaticais, ortográficos e de pontuação
+- Corrige concordância verbal e nominal
+- Detecta erros de regência e crase
+- Usa SEMPRE português académico formal
+
+### 2. Linguagem Académica
+- Substitui linguagem informal por expressões académicas
+- Elimina coloquialismos e gírias
+- Sugere vocabulário técnico adequado à área
+- Melhora precisão terminológica
+
+### 3. Estrutura Textual
+- Avalia organização dos parágrafos
+- Verifica presença de tópico frasal, desenvolvimento e conclusão
+- Analisa transições entre ideias
+- Verifica coesão e coerência textual
+
+### 4. Argumentação e Coerência
+- Detecta contradições e inconsistências
+- Verifica lógica argumentativa
+- Identifica afirmações sem fundamentação
+- Analisa se os argumentos suportam as conclusões
+
+### 5. Repetições e Redundâncias
+- Identifica palavras e expressões repetidas
+- Detecta redundâncias conceptuais
+- Sugere sinónimos e variações
+- Melhora variedade lexical
+
+### 6. Análise por Capítulo
+- **Introdução**: contexto, justificativa, problema, objetivos, estrutura
+- **Revisão de Literatura**: fontes, síntese, análise crítica, atualidade
+- **Metodologia**: clareza, rigor, reprodutibilidade, adequação
+- **Resultados**: objetividade, organização, relação com objetivos
+- **Conclusão**: síntese, resposta ao problema, limitações, trabalhos futuros
+
+### 7. Score de Qualidade Académica
+Quando avaliar um texto, SEMPRE apresente scores em 5 critérios:
+- **Gramática & Ortografia**: X/10
+- **Linguagem Académica**: X/10
+- **Clareza & Objectividade**: X/10
+- **Coerência & Argumentação**: X/10
+- **Estrutura Textual**: X/10
+- **Score Global**: X/10
+
+### 8. Comparação de Versões
+Quando receber duas versões de texto, analise diferenças, melhorias e regressões.
+
+## FORMATO DAS RESPOSTAS:
+
+Use SEMPRE esta estrutura para revisões:
+
+### 🔴 Problemas Críticos
+[Erros que comprometem a qualidade — DEVEM ser corrigidos]
+
+### 🟡 Melhorias Importantes  
+[Aspectos que devem ser melhorados para maior qualidade]
+
+### 🟢 Sugestões de Melhoria
+[Refinamentos opcionais para excelência]
+
+### ✅ Pontos Positivos
+[O que está bem no texto]
+
+### 📝 Texto Revisto
+[Versão melhorada do texto quando solicitado]
+
+Para decisões importantes, use: MEMORY: [conteúdo]
+
+## CONTEXTO DO PROJETO:
+${buildProjectContext(project, memory)}
+
+${docs.filter(d => d.include_in_context).length > 0 ? `## DOCUMENTOS DE REFERÊNCIA:\n${buildDocumentsContext(docs)}` : ""}
+
+Lembre-se: seja rigoroso, específico e construtivo. Dê exemplos concretos de como melhorar cada problema identificado. Use linguagem académica nas suas sugestões.`;
+}
+
+// ─── Score display ────────────────────────────────────────────────────────────
+interface ScoreData {
+  gramatica?: number;
+  linguagem?: number;
+  clareza?: number;
+  coerencia?: number;
+  estrutura?: number;
+  global?: number;
+}
+
+function parseScores(text: string): ScoreData | null {
+  const scores: ScoreData = {};
+  const patterns = [
+    { key: "gramatica" as const, regex: /gramática[^:]*:\s*(\d+(?:\.\d+)?)\s*\/\s*10/i },
+    { key: "linguagem" as const, regex: /linguagem[^:]*:\s*(\d+(?:\.\d+)?)\s*\/\s*10/i },
+    { key: "clareza" as const, regex: /clareza[^:]*:\s*(\d+(?:\.\d+)?)\s*\/\s*10/i },
+    { key: "coerencia" as const, regex: /coer[eê]ncia[^:]*:\s*(\d+(?:\.\d+)?)\s*\/\s*10/i },
+    { key: "estrutura" as const, regex: /estrutura[^:]*:\s*(\d+(?:\.\d+)?)\s*\/\s*10/i },
+    { key: "global" as const, regex: /(?:global|geral|total)[^:]*:\s*(\d+(?:\.\d+)?)\s*\/\s*10/i },
+  ];
+  let found = false;
+  for (const p of patterns) {
+    const m = text.match(p.regex);
+    if (m) { scores[p.key] = parseFloat(m[1]); found = true; }
+  }
+  return found ? scores : null;
+}
+
+function ScoreBar({ label, value }: { label: string; value: number }) {
+  const color = value >= 8 ? "bg-emerald-500" : value >= 6 ? "bg-amber-500" : "bg-red-500";
+  return (
+    <div>
+      <div className="mb-1 flex items-center justify-between text-xs">
+        <span className="text-muted-foreground">{label}</span>
+        <span className={`font-bold ${value >= 8 ? "text-emerald-600" : value >= 6 ? "text-amber-600" : "text-red-600"}`}>{value}/10</span>
+      </div>
+      <div className="h-1.5 rounded-full bg-muted overflow-hidden">
+        <div className={`h-full rounded-full transition-all duration-700 ${color}`} style={{ width: `${value * 10}%` }} />
+      </div>
+    </div>
+  );
+}
+
+// ─── Main component ───────────────────────────────────────────────────────────
+export function RevisorWorkspace({ agent }: { agent: Agent }) {
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [project, setProject] = useState<Project | null>(null);
+  const [memory, setMemory] = useState<MemoryItem[]>([]);
+  const [documents, setDocuments] = useState<ProjectDocument[]>([]);
+  const [activeTab, setActiveTab] = useState<"editor" | "compare" | "analysis">("editor");
+  const [selectedMode, setSelectedMode] = useState("completa");
+  const [selectedChapter, setSelectedChapter] = useState("Introdução");
+  const [currentText, setCurrentText] = useState("");
+  const [textVersions, setTextVersions] = useState<TextVersion[]>([]);
+  const [currentAnalysis, setCurrentAnalysis] = useState<RevisionAnalysis | null>(null);
+  const [inlineSuggestions, setInlineSuggestions] = useState<SuggestionInline[]>([]);
+  const [showSuggestions, setShowSuggestions] = useState(true);
+  const [compareV1, setCompareV1] = useState("");
+  const [compareV2, setCompareV2] = useState("");
+  const [latestScores, setLatestScores] = useState<ScoreData | null>(null);
+  const [expandedTools, setExpandedTools] = useState(true);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const editorRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const p = await getOrCreateActiveProject();
+        if (cancelled) return;
+        setProject(p);
+        const [mem, hist, docs] = await Promise.all([
+          listMemory(p.id),
+          loadDbMessages(p.id, agent.id),
+          listDocuments(p.id),
+        ]);
+        if (cancelled) return;
+        setMemory(mem);
+        setDocuments(docs);
+        setMessages(hist.map((m) => ({ role: m.role, content: m.content, timestamp: new Date(m.created_at).getTime() })));
+      } catch (e) {
+        console.error(e);
+        toast.error("Erro ao carregar projeto");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [agent.id]);
+
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+  }, [messages, loading]);
+
+  const extractMemoryLines = (text: string) => {
+    const memos: string[] = [];
+    const lines = text.split("\n");
+    const kept: string[] = [];
+    for (const l of lines) {
+      const m = l.match(/^\s*MEMORY:\s*(.+)$/i);
+      if (m) memos.push(m[1].trim());
+      else kept.push(l);
+    }
+    return { clean: kept.join("\n").trim(), memos };
+  };
+
+  const send = useCallback(async (overrideText?: string) => {
+    const text = (overrideText ?? input).trim();
+    if (!text || loading) return;
+    if (!project) { toast.error("Projeto não carregado"); return; }
+
+    const userMsg: ChatMessage = { role: "user", content: text, timestamp: Date.now() };
+    const next = [...messages, userMsg];
+    setMessages(next);
+    setInput("");
+    setLoading(true);
+    insertMessage(project.id, agent.id, "user", text).catch(console.error);
+
+    let acc = "";
+    const updateAssistant = (chunk: string) => {
+      acc += chunk;
+      setMessages((prev) => {
+        const last = prev[prev.length - 1];
+        if (last?.role === "assistant") return prev.map((m, i) => (i === prev.length - 1 ? { ...m, content: acc } : m));
+        return [...prev, { role: "assistant", content: acc, timestamp: Date.now() }];
+      });
+    };
+
+    try {
+      const systemPrompt = buildRevisorSystemPrompt(project, memory, documents);
+      const resp = await fetch(CHAT_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+        },
+        body: JSON.stringify({
+          agent: agent.id,
+          systemPrompt,
+          projectContext: buildProjectContext(project, memory),
+          documentsContext: buildDocumentsContext(documents),
+          messages: next.map((m) => ({ role: m.role, content: m.content })),
+        }),
+      });
+
+      if (!resp.ok || !resp.body) {
+        const err = await resp.json().catch(() => ({ error: "Falha ao iniciar" }));
+        toast.error(err.error || "Erro ao enviar mensagem");
+        setMessages(next);
+        return;
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      let done = false;
+      while (!done) {
+        const { done: d, value } = await reader.read();
+        if (d) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl: number;
+        while ((nl = buf.indexOf("\n")) !== -1) {
+          let line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          if (line.endsWith("\r")) line = line.slice(0, -1);
+          if (!line.startsWith("data: ")) continue;
+          const json = line.slice(6).trim();
+          if (json === "[DONE]") { done = true; break; }
+          try {
+            const parsed = JSON.parse(json);
+            const c = parsed.choices?.[0]?.delta?.content;
+            if (c) updateAssistant(c);
+          } catch {
+            buf = line + "\n" + buf;
+            break;
+          }
+        }
+      }
+
+      if (acc) {
+        const { clean, memos } = extractMemoryLines(acc);
+        if (memos.length > 0) {
+          setMessages((prev) => prev.map((m, i) => (i === prev.length - 1 && m.role === "assistant" ? { ...m, content: clean } : m)));
+          for (const memo of memos) {
+            try { await addMemory(project.id, agent.id, memo, "revision"); } catch (e) { console.error(e); }
+          }
+          const fresh = await listMemory(project.id);
+          setMemory(fresh);
+        }
+
+        // Parse scores from response
+        const scores = parseScores(clean || acc);
+        if (scores) {
+          setLatestScores(scores);
+          setSidebarTab("score");
+        }
+
+        await insertMessage(project.id, agent.id, "assistant", clean || acc);
+      }
+    } catch (e) {
+      toast.error("Erro de conexão");
+      console.error(e);
+    } finally {
+      setLoading(false);
+    }
+  }, [input, loading, project, memory, documents, messages, agent.id]);
+
+  // Build revision prompt from the panel
+  const sendRevision = () => {
+    if (!textToReview.trim()) {
+      toast.error("Cole o texto a rever primeiro");
+      return;
+    }
+    const mode = REVISION_MODES.find(m => m.id === selectedMode);
+    const prompt = `**Modo: ${mode?.label} | Capítulo: ${selectedChapter}**\n\nRevisa académicamente o seguinte texto:\n\n---\n${textToReview}\n---\n\nAplica o modo "${mode?.label}": ${mode?.desc}. Apresenta score de qualidade e versão revista.`;
+    send(prompt);
+    setTextToReview("");
+  };
+
+  const sendComparison = () => {
+    if (!compareV1.trim() || !compareV2.trim()) {
+      toast.error("Preenche as duas versões");
+      return;
+    }
+    const prompt = `**Comparação de Versões — ${selectedChapter}**\n\n**VERSÃO ORIGINAL:**\n---\n${compareV1}\n---\n\n**VERSÃO NOVA:**\n---\n${compareV2}\n---\n\nCompara as duas versões. Identifica: melhorias realizadas, problemas mantidos, regressões (se houver), e avalia se a nova versão é melhor que a original. Dá um score de qualidade para cada versão.`;
+    send(prompt);
+    setCompareV1("");
+    setCompareV2("");
+    setShowCompare(false);
+  };
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+  };
+
+  const onClear = async () => {
+    if (!project) return;
+    await clearDbMessages(project.id, agent.id);
+    setMessages([]);
+    setLatestScores(null);
+    toast.success("Histórico limpo");
+  };
+
+  const projectIncomplete = !project?.theme && !project?.objectives;
+
+  return (
+    <div className="flex h-full overflow-hidden">
+      {/* ── LEFT: Chat ─────────────────────────────────────────────────────── */}
+      <div className="flex flex-1 flex-col min-w-0">
+        {/* Header */}
+        <div className="flex items-center justify-between border-b bg-card/60 px-5 py-3.5 backdrop-blur shrink-0">
+          <div className="flex items-center gap-3">
+            <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-primary/10 text-primary">
+              <FileSearch className="h-5 w-5" />
+            </div>
+            <div>
+              <h1 className="font-display text-lg font-semibold leading-tight">{agent.name}</h1>
+              <p className="text-[11px] text-muted-foreground flex items-center gap-2">
+                Revisão científica e académica profissional
+                {memory.length > 0 && (
+                  <span className="inline-flex items-center gap-1">
+                    <Brain className="h-3 w-3 text-primary" /> {memory.length} memórias
+                  </span>
+                )}
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline" size="sm"
+              onClick={() => setShowCompare(v => !v)}
+              className="h-8 text-xs gap-1.5"
+            >
+              <GitCompare className="h-3.5 w-3.5" />
+              Comparar versões
+            </Button>
+            {messages.length > 0 && (
+              <Button variant="ghost" size="sm" onClick={onClear} className="text-muted-foreground h-8 text-xs">
+                <Trash2 className="mr-1.5 h-3.5 w-3.5" /> Limpar
+              </Button>
+            )}
+          </div>
+        </div>
+
+        {projectIncomplete && (
+          <div className="border-b bg-amber-50 px-5 py-2 text-xs text-amber-900 dark:bg-amber-950/30 dark:text-amber-200 flex items-center gap-2 shrink-0">
+            <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+            Configure o projeto para revisão contextualizada.{" "}
+            <Link to="/project" className="font-semibold underline">Configurar</Link>
+          </div>
+        )}
+
+        {/* Compare panel */}
+        {showCompare && (
+          <div className="border-b bg-card/50 px-5 py-4 shrink-0 space-y-3">
+            <div className="flex items-center justify-between">
+              <p className="text-sm font-medium flex items-center gap-2">
+                <GitCompare className="h-4 w-4 text-primary" /> Comparar duas versões
+              </p>
+              <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => setShowCompare(false)}>Fechar</Button>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <p className="mb-1 text-xs font-medium text-muted-foreground">Versão Original</p>
+                <Textarea
+                  value={compareV1}
+                  onChange={e => setCompareV1(e.target.value)}
+                  placeholder="Cole a versão original aqui..."
+                  rows={5}
+                  className="resize-none text-xs"
+                />
+              </div>
+              <div>
+                <p className="mb-1 text-xs font-medium text-muted-foreground">Versão Nova</p>
+                <Textarea
+                  value={compareV2}
+                  onChange={e => setCompareV2(e.target.value)}
+                  placeholder="Cole a versão nova aqui..."
+                  rows={5}
+                  className="resize-none text-xs"
+                />
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <select
+                value={selectedChapter}
+                onChange={e => setSelectedChapter(e.target.value)}
+                className="rounded-lg border bg-background px-3 py-1.5 text-xs"
+              >
+                {CHAPTER_TYPES.map(c => <option key={c}>{c}</option>)}
+              </select>
+              <Button size="sm" onClick={sendComparison} disabled={loading} className="h-8 text-xs">
+                <GitCompare className="mr-1.5 h-3.5 w-3.5" /> Comparar agora
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {/* Messages */}
+        <ScrollArea className="flex-1" ref={scrollRef as never}>
+          <div className="mx-auto max-w-2xl px-4 py-5 sm:px-5">
+            {messages.length === 0 ? (
+              <div className="space-y-6">
+                <div className="flex flex-col items-center py-8 text-center">
+                  <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-primary/10 text-primary">
+                    <FileSearch className="h-8 w-8" />
+                  </div>
+                  <h2 className="font-display text-2xl font-semibold">Revisor Académico IA</h2>
+                  <p className="mt-2 max-w-md text-sm text-muted-foreground leading-relaxed">
+                    Cole o texto no painel lateral, escolha o modo de revisão e receba uma análise científica profissional com score de qualidade.
+                  </p>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  {QUICK_ACTIONS.map((qa) => (
+                    <button
+                      key={qa.label}
+                      onClick={() => send(qa.prompt)}
+                      className="group flex items-center gap-2 rounded-xl border bg-card px-3.5 py-2.5 text-left text-sm font-medium transition-all hover:border-primary/40 hover:bg-primary/5 hover:shadow-sm"
+                    >
+                      <ArrowRight className="h-3.5 w-3.5 text-primary shrink-0 transition-transform group-hover:translate-x-0.5" />
+                      {qa.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-5">
+                {messages.map((m, i) => (
+                  <RevisionMessageBubble key={i} message={m} />
+                ))}
+                {loading && messages[messages.length - 1]?.role === "user" && (
+                  <div className="flex gap-3">
+                    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
+                      <FileSearch className="h-4 w-4" />
+                    </div>
+                    <div className="flex items-center gap-1 pt-2">
+                      <span className="h-2 w-2 animate-bounce rounded-full bg-primary/40" style={{ animationDelay: "0ms" }} />
+                      <span className="h-2 w-2 animate-bounce rounded-full bg-primary/40" style={{ animationDelay: "150ms" }} />
+                      <span className="h-2 w-2 animate-bounce rounded-full bg-primary/40" style={{ animationDelay: "300ms" }} />
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </ScrollArea>
+
+        {/* Input */}
+        <div className="border-t bg-card/50 backdrop-blur shrink-0">
+          <div className="mx-auto max-w-2xl px-4 py-3 sm:px-5">
+            {messages.length > 0 && (
+              <div className="mb-2 flex gap-1.5 overflow-x-auto pb-1">
+                {QUICK_ACTIONS.slice(0, 4).map((qa) => (
+                  <button
+                    key={qa.label}
+                    onClick={() => send(qa.prompt)}
+                    disabled={loading}
+                    className="shrink-0 rounded-full border bg-background px-3 py-1 text-[11px] font-medium text-muted-foreground transition-colors hover:border-primary/40 hover:text-primary disabled:opacity-40"
+                  >
+                    {qa.label}
+                  </button>
+                ))}
+              </div>
+            )}
+            <div className="flex items-end gap-2 rounded-2xl border bg-background p-2 shadow-sm focus-within:ring-2 focus-within:ring-ring/30">
+              <Textarea
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={onKeyDown}
+                placeholder="Cole texto ou faça perguntas ao revisor..."
+                rows={1}
+                className="min-h-[40px] max-h-36 resize-none border-0 bg-transparent px-2 py-2 text-sm shadow-none focus-visible:ring-0"
+              />
+              <Button onClick={() => send()} disabled={!input.trim() || loading} size="icon" className="h-9 w-9 shrink-0 rounded-xl">
+                <Send className="h-4 w-4" />
+              </Button>
+            </div>
+            <p className="mt-1.5 text-center text-[10px] text-muted-foreground">
+              Enter para enviar · Shift+Enter para nova linha
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {/* ── RIGHT: Sidebar ─────────────────────────────────────────────────── */}
+      <aside className="hidden lg:flex w-72 xl:w-80 flex-col border-l bg-card/30 overflow-hidden">
+        {/* Tabs */}
+        <div className="flex border-b shrink-0">
+          {(["tools", "score", "history"] as const).map((tab) => {
+            const icons = { tools: PenLine, score: BarChart2, history: Brain };
+            const labels = { tools: "Ferramentas", score: "Score", history: "Memória" };
+            const Icon = icons[tab];
+            return (
+              <button
+                key={tab}
+                onClick={() => setSidebarTab(tab)}
+                className={`flex flex-1 items-center justify-center gap-1.5 py-3 text-xs font-medium transition-colors border-b-2 ${sidebarTab === tab ? "border-primary text-primary" : "border-transparent text-muted-foreground hover:text-foreground"}`}
+              >
+                <Icon className="h-3.5 w-3.5" />
+                {labels[tab]}
+              </button>
+            );
+          })}
+        </div>
+
+        <ScrollArea className="flex-1">
+          <div className="p-4 space-y-4">
+
+            {/* ── TOOLS TAB ──────────────────────────────────────────────── */}
+            {sidebarTab === "tools" && (
+              <div className="space-y-4">
+                {/* Text input area */}
+                <div>
+                  <p className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wide">Texto para rever</p>
+                  <Textarea
+                    value={textToReview}
+                    onChange={e => setTextToReview(e.target.value)}
+                    placeholder="Cole aqui o texto que deseja rever..."
+                    rows={7}
+                    className="resize-none text-xs rounded-xl"
+                  />
+                  {textToReview && (
+                    <p className="mt-1 text-[10px] text-muted-foreground text-right">{textToReview.length} caracteres</p>
+                  )}
+                </div>
+
+                {/* Chapter selector */}
+                <div>
+                  <p className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wide">Capítulo</p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {CHAPTER_TYPES.map(c => (
+                      <button
+                        key={c}
+                        onClick={() => setSelectedChapter(c)}
+                        className={`rounded-full px-2.5 py-1 text-[11px] font-medium transition-colors border ${selectedChapter === c ? "bg-primary text-primary-foreground border-primary" : "bg-background border-border text-muted-foreground hover:border-primary/40"}`}
+                      >
+                        {c}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Revision modes */}
+                <div>
+                  <button
+                    onClick={() => setExpandedModes(v => !v)}
+                    className="w-full flex items-center justify-between mb-2"
+                  >
+                    <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Modo de revisão</p>
+                    {expandedModes ? <ChevronUp className="h-3.5 w-3.5 text-muted-foreground" /> : <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />}
+                  </button>
+                  {expandedModes && (
+                    <div className="space-y-1.5">
+                      {REVISION_MODES.map(mode => {
+                        const Icon = mode.icon;
+                        const isSelected = selectedMode === mode.id;
+                        return (
+                          <button
+                            key={mode.id}
+                            onClick={() => setSelectedMode(mode.id)}
+                            className={`w-full flex items-start gap-2.5 rounded-xl border px-3 py-2.5 text-left transition-all ${isSelected ? "border-primary bg-primary/5" : "border-border bg-background hover:border-primary/30"}`}
+                          >
+                            <Icon className={`h-4 w-4 shrink-0 mt-0.5 ${isSelected ? "text-primary" : "text-muted-foreground"}`} />
+                            <div>
+                              <p className={`text-xs font-medium ${isSelected ? "text-primary" : ""}`}>{mode.label}</p>
+                              <p className="text-[10px] text-muted-foreground">{mode.desc}</p>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                {/* Send button */}
+                <Button
+                  onClick={sendRevision}
+                  disabled={!textToReview.trim() || loading}
+                  className="w-full"
+                  size="sm"
+                >
+                  <Sparkles className="mr-2 h-3.5 w-3.5" />
+                  Rever texto agora
+                </Button>
+
+                {/* Documents */}
+                {documents.filter(d => d.include_in_context).length > 0 && (
+                  <div>
+                    <p className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wide flex items-center gap-1">
+                      <FileText className="h-3 w-3" /> Documentos no contexto
+                    </p>
+                    <div className="space-y-1.5">
+                      {documents.filter(d => d.include_in_context).map(doc => (
+                        <div key={doc.id} className="flex items-center gap-2 rounded-lg border bg-background px-3 py-2">
+                          <BookOpen className="h-3.5 w-3.5 text-primary shrink-0" />
+                          <span className="text-[11px] truncate">{doc.filename}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* ── SCORE TAB ──────────────────────────────────────────────── */}
+            {sidebarTab === "score" && (
+              <div className="space-y-4">
+                {!latestScores ? (
+                  <div className="flex flex-col items-center py-12 text-center">
+                    <BarChart2 className="h-10 w-10 text-muted-foreground/30 mb-3" />
+                    <p className="text-sm font-medium text-muted-foreground">Nenhum score ainda</p>
+                    <p className="text-xs text-muted-foreground/60 mt-1 max-w-[180px]">Envie um texto para revisão e o score aparecerá aqui automaticamente</p>
+                  </div>
+                ) : (
+                  <>
+                    {/* Global score */}
+                    {latestScores.global !== undefined && (
+                      <div className="flex flex-col items-center py-5 rounded-2xl border bg-card">
+                        <div className="relative h-24 w-24">
+                          <svg className="h-24 w-24 -rotate-90" viewBox="0 0 100 100">
+                            <circle cx="50" cy="50" r="38" fill="none" stroke="currentColor" strokeWidth="10" className="text-muted/30" />
+                            <circle
+                              cx="50" cy="50" r="38" fill="none"
+                              stroke="currentColor" strokeWidth="10" strokeLinecap="round"
+                              strokeDasharray={`${2 * Math.PI * 38}`}
+                              strokeDashoffset={`${2 * Math.PI * 38 * (1 - latestScores.global / 10)}`}
+                              className={latestScores.global >= 8 ? "text-emerald-500" : latestScores.global >= 6 ? "text-amber-500" : "text-red-500"}
+                              style={{ transition: "stroke-dashoffset 0.7s ease" }}
+                            />
+                          </svg>
+                          <div className="absolute inset-0 flex flex-col items-center justify-center">
+                            <span className="font-display text-2xl font-bold">{latestScores.global}</span>
+                            <span className="text-[9px] text-muted-foreground">/10</span>
+                          </div>
+                        </div>
+                        <p className="mt-2 text-sm font-semibold">
+                          {latestScores.global >= 8 ? "Excelente" : latestScores.global >= 6 ? "Bom" : latestScores.global >= 4 ? "Razoável" : "Precisa de melhoria"}
+                        </p>
+                        <p className="text-xs text-muted-foreground">Score global de qualidade</p>
+                      </div>
+                    )}
+
+                    {/* Individual scores */}
+                    <div className="space-y-3 rounded-xl border bg-card p-4">
+                      {latestScores.gramatica !== undefined && <ScoreBar label="Gramática & Ortografia" value={latestScores.gramatica} />}
+                      {latestScores.linguagem !== undefined && <ScoreBar label="Linguagem Académica" value={latestScores.linguagem} />}
+                      {latestScores.clareza !== undefined && <ScoreBar label="Clareza & Objectividade" value={latestScores.clareza} />}
+                      {latestScores.coerencia !== undefined && <ScoreBar label="Coerência & Argumentação" value={latestScores.coerencia} />}
+                      {latestScores.estrutura !== undefined && <ScoreBar label="Estrutura Textual" value={latestScores.estrutura} />}
+                    </div>
+
+                    {/* Quality indicators */}
+                    <div className="space-y-1.5">
+                      <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Indicadores</p>
+                      {[
+                        { label: "Pronto para entrega", ok: (latestScores.global ?? 0) >= 8 },
+                        { label: "Linguagem académica adequada", ok: (latestScores.linguagem ?? 0) >= 7 },
+                        { label: "Estrutura sólida", ok: (latestScores.estrutura ?? 0) >= 7 },
+                        { label: "Argumentação coerente", ok: (latestScores.coerencia ?? 0) >= 7 },
+                      ].map(ind => (
+                        <div key={ind.label} className="flex items-center gap-2 rounded-lg border bg-background px-3 py-2">
+                          {ind.ok
+                            ? <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500 shrink-0" />
+                            : <XCircle className="h-3.5 w-3.5 text-red-400 shrink-0" />}
+                          <span className="text-xs">{ind.label}</span>
+                        </div>
+                      ))}
+                    </div>
+
+                    <Button variant="outline" size="sm" className="w-full text-xs" onClick={() => send("Faz uma nova avaliação completa de qualidade do último texto revisto.")}>
+                      <RefreshCw className="mr-1.5 h-3.5 w-3.5" /> Reavaliar
+                    </Button>
+                  </>
+                )}
+              </div>
+            )}
+
+            {/* ── MEMORY TAB ─────────────────────────────────────────────── */}
+            {sidebarTab === "history" && (
+              <div className="space-y-3">
+                <p className="text-xs text-muted-foreground">Decisões e revisões importantes guardadas na memória partilhada do projeto.</p>
+                {memory.filter(m => m.agent_id === agent.id).length === 0 ? (
+                  <div className="flex flex-col items-center py-10 text-center">
+                    <Brain className="h-8 w-8 text-muted-foreground/30 mb-2" />
+                    <p className="text-xs text-muted-foreground">Ainda sem memórias deste revisor</p>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {memory.filter(m => m.agent_id === agent.id).slice(0, 15).map(m => (
+                      <div key={m.id} className="rounded-xl border bg-background p-3">
+                        <div className="mb-1.5 flex items-center gap-1.5">
+                          <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-medium text-primary">{m.kind}</span>
+                          <span className="text-[10px] text-muted-foreground">{new Date(m.created_at).toLocaleDateString()}</span>
+                        </div>
+                        <p className="text-xs leading-relaxed text-muted-foreground">{m.content}</p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Suggestions */}
+                <div className="pt-2 border-t">
+                  <p className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wide flex items-center gap-1">
+                    <Lightbulb className="h-3 w-3" /> Acções rápidas
+                  </p>
+                  <div className="space-y-1.5">
+                    {[
+                      "Resume as principais revisões feitas até agora no projeto",
+                      "Quais são os erros mais frequentes no meu texto?",
+                      "Que aspectos do meu PFC ainda precisam de revisão?",
+                    ].map(prompt => (
+                      <button
+                        key={prompt}
+                        onClick={() => send(prompt)}
+                        className="w-full flex items-start gap-2 rounded-lg border bg-background px-3 py-2 text-left text-xs text-muted-foreground transition-all hover:border-primary/40 hover:text-foreground"
+                      >
+                        <ChevronRight className="h-3 w-3 text-primary shrink-0 mt-0.5" />
+                        {prompt}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </ScrollArea>
+      </aside>
+    </div>
+  );
+}
+
+// ─── Message bubble with revision-specific rendering ──────────────────────────
+function RevisionMessageBubble({ message }: { message: ChatMessage }) {
+  const isUser = message.role === "user";
+  const [copied, setCopied] = useState(false);
+
+  const copyText = () => {
+    navigator.clipboard.writeText(message.content);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  const renderContent = (text: string) => {
+    const lines = text.split("\n");
+    const elements: React.ReactNode[] = [];
+    let i = 0;
+
+    while (i < lines.length) {
+      const line = lines[i];
+
+      // Section headers with color coding
+      if (line.includes("🔴") || line.toLowerCase().includes("problemas críticos")) {
+        elements.push(
+          <div key={i} className="mt-3 mb-2 flex items-center gap-2">
+            <XCircle className="h-4 w-4 text-red-500 shrink-0" />
+            <span className="text-sm font-semibold text-red-600 dark:text-red-400">{line.replace(/^#+\s*/, "").replace("🔴", "").trim()}</span>
+          </div>
+        );
+      } else if (line.includes("🟡") || line.toLowerCase().includes("melhorias importantes")) {
+        elements.push(
+          <div key={i} className="mt-3 mb-2 flex items-center gap-2">
+            <AlertTriangle className="h-4 w-4 text-amber-500 shrink-0" />
+            <span className="text-sm font-semibold text-amber-600 dark:text-amber-400">{line.replace(/^#+\s*/, "").replace("🟡", "").trim()}</span>
+          </div>
+        );
+      } else if (line.includes("🟢") || line.toLowerCase().includes("sugestões de melhoria")) {
+        elements.push(
+          <div key={i} className="mt-3 mb-2 flex items-center gap-2">
+            <Lightbulb className="h-4 w-4 text-blue-500 shrink-0" />
+            <span className="text-sm font-semibold text-blue-600 dark:text-blue-400">{line.replace(/^#+\s*/, "").replace("🟢", "").trim()}</span>
+          </div>
+        );
+      } else if (line.includes("✅") || line.toLowerCase().includes("pontos positivos")) {
+        elements.push(
+          <div key={i} className="mt-3 mb-2 flex items-center gap-2">
+            <CheckCircle2 className="h-4 w-4 text-emerald-500 shrink-0" />
+            <span className="text-sm font-semibold text-emerald-600 dark:text-emerald-400">{line.replace(/^#+\s*/, "").replace("✅", "").trim()}</span>
+          </div>
+        );
+      } else if (line.includes("📝") || line.toLowerCase().includes("texto revisto")) {
+        elements.push(
+          <div key={i} className="mt-3 mb-2 flex items-center gap-2">
+            <PenLine className="h-4 w-4 text-primary shrink-0" />
+            <span className="text-sm font-semibold text-primary">{line.replace(/^#+\s*/, "").replace("📝", "").trim()}</span>
+          </div>
+        );
+      } else if (line.match(/^#{1,3} /)) {
+        elements.push(<h3 key={i} className="mt-3 mb-1 text-sm font-semibold">{line.replace(/^#+\s*/, "")}</h3>);
+      } else if (line.match(/^[-*] /)) {
+        const items: string[] = [];
+        while (i < lines.length && lines[i].match(/^[-*] /)) {
+          items.push(lines[i].slice(2));
+          i++;
+        }
+        elements.push(
+          <ul key={`ul-${i}`} className="my-1 space-y-1 pl-4">
+            {items.map((item, j) => (
+              <li key={j} className="relative text-sm before:absolute before:-left-3 before:content-['·'] before:text-primary">
+                {renderInline(item)}
+              </li>
+            ))}
+          </ul>
+        );
+        continue;
+      } else if (line === "") {
+        elements.push(<div key={`sp-${i}`} className="h-1" />);
+      } else {
+        // Highlight score lines
+        if (line.match(/\d+\/10/)) {
+          elements.push(
+            <p key={i} className="text-sm leading-relaxed font-medium">
+              {renderInline(line)}
+            </p>
+          );
+        } else {
+          elements.push(<p key={i} className="text-sm leading-relaxed">{renderInline(line)}</p>);
+        }
+      }
+      i++;
+    }
+    return elements;
+  };
+
+  const renderInline = (text: string): React.ReactNode => {
+    const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`|\d+\/10)/g);
+    return parts.map((part, i) => {
+      if (part.startsWith("**") && part.endsWith("**")) return <strong key={i} className="font-semibold">{part.slice(2, -2)}</strong>;
+      if (part.startsWith("`") && part.endsWith("`")) return <code key={i} className="rounded bg-muted px-1 py-0.5 text-xs font-mono">{part.slice(1, -1)}</code>;
+      if (part.match(/^\d+\/10$/)) return <span key={i} className="font-bold text-primary">{part}</span>;
+      return part;
+    });
+  };
+
+  return (
+    <div className={`flex gap-3 ${isUser ? "flex-row-reverse" : ""}`}>
+      <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-xl ${isUser ? "bg-secondary text-secondary-foreground" : "bg-primary/10 text-primary"}`}>
+        {isUser ? <User className="h-4 w-4" /> : <FileSearch className="h-4 w-4" />}
+      </div>
+      <div className={`group max-w-[88%] rounded-2xl px-4 py-3 ${isUser ? "bg-primary text-primary-foreground" : "bg-card border"}`}>
+        {isUser
+          ? <p className="text-sm leading-relaxed whitespace-pre-wrap">{message.content}</p>
+          : (
+            <>
+              <div className="space-y-0.5">{renderContent(message.content)}</div>
+              <button
+                onClick={copyText}
+                className="mt-2 flex items-center gap-1 text-[10px] text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity"
+              >
+                <Copy className="h-3 w-3" />
+                {copied ? "Copiado!" : "Copiar texto"}
+              </button>
+            </>
+          )
+        }
+      </div>
+    </div>
+  );
+}
+
+function ChevronRight({ className }: { className?: string }) {
+  return <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" /></svg>;
+}

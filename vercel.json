@@ -2,7 +2,7 @@
   "version": 2,
   "name": "acadia-assistente-academico",
   "buildCommand": "npm run build",
-  "outputDirectory": "dist",
+  "outputDirectory": "dist/client",
   "installCommand": "npm install",
   "framework": "vite",
   "routes": [
